@@ -1,9 +1,16 @@
 # Copyright 2025 - Canonical Ltd
 # SPDX-License-Identifier: Apache-2.0
 
+from datetime import datetime, timedelta, timezone
 import logging
 import pathlib
 import shutil
+
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from regress_stack.core import utils as core_utils
 from regress_stack.modules import keystone, mysql, neutron, nova, ovn, rabbitmq
@@ -32,6 +39,11 @@ OCTAVIA_ROLES = (
     "load-balancer_member",
     "load-balancer_admin",
 )
+CERT_DIR = "/etc/octavia/certs"
+AMPHORA_CA_CERT = str(pathlib.Path(CERT_DIR, "amphora_ca.cert.pem"))
+AMPHORA_CA_KEY = str(pathlib.Path(CERT_DIR, "amphora_ca.key.pem"))
+AMPHORA_CA_COMBINED = str(pathlib.Path(CERT_DIR, "amphora_ca.cert-and-key.pem"))
+AMPHORA_CA_KEY_PASSPHRASE = "changeme"
 SOCKET_DIR = "/var/run/octavia"
 
 
@@ -57,6 +69,78 @@ TEST_EXCLUDE_REGEXES = [
 ]
 
 
+def create_ca():
+    key = rsa.generate_private_key(public_exponent=65537, key_size=1024)
+    with open(AMPHORA_CA_KEY, "wb") as keyfile:
+        keyfile.write(
+            key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.BestAvailableEncryption(
+                    AMPHORA_CA_KEY_PASSPHRASE.encode("utf-8")
+                ),
+            )
+        )
+
+    name = x509.Name(
+        [
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "UK"),
+            x509.NameAttribute(NameOID.LOCALITY_NAME, "London"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Canonical Group Limited"),
+            x509.NameAttribute(NameOID.COMMON_NAME, "regress-stack"),
+        ]
+    )
+
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.now(timezone.utc))
+        .not_valid_after(datetime.now(timezone.utc) + timedelta(days=365))
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                crl_sign=True,
+                key_cert_sign=True,
+                key_encipherment=True,
+                content_commitment=True,
+                data_encipherment=False,
+                key_agreement=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage(
+                [
+                    x509.oid.ExtendedKeyUsageOID.SERVER_AUTH,
+                    x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH,
+                    x509.oid.ExtendedKeyUsageOID.EMAIL_PROTECTION,
+                ]
+            ),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    with open(AMPHORA_CA_CERT, "wb") as certfile:
+        certfile.write(cert.public_bytes(serialization.Encoding.PEM))
+
+    with open(AMPHORA_CA_COMBINED, "wb") as combined:
+        combined.write(
+            key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.BestAvailableEncryption(
+                    AMPHORA_CA_KEY_PASSPHRASE.encode("utf-8")
+                ),
+            )
+        )
+        combined.write(cert.public_bytes(serialization.Encoding.PEM))
+
+
 def setup():
     db_user, db_pass = mysql.ensure_service(SERVICE)
     rabbit_user, rabbit_pass = rabbitmq.ensure_service(SERVICE)
@@ -66,6 +150,9 @@ def setup():
     socket_dir = pathlib.Path(SOCKET_DIR)
     socket_dir.mkdir(parents=True, exist_ok=True)
     shutil.chown(socket_dir, SERVICE, SERVICE)
+    ca_dir = pathlib.Path(CERT_DIR)
+    ca_dir.mkdir(parents=True, exist_ok=True)
+    create_ca()
     module_utils.cfg_set(
         CONF,
         (
@@ -97,6 +184,18 @@ def setup():
                 "ovn_sb_connection": ovn.OVNSB_CONNECTION,
             },
         ),
+        *module_utils.dict_to_cfg_set_args(
+            "certificates",
+            {
+                "cert_generator": "local_cert_generator",
+                "ca_certificate": AMPHORA_CA_CERT,
+                "ca_private_key": AMPHORA_CA_KEY,
+                "ca_private_key_passphrase": AMPHORA_CA_KEY_PASSPHRASE,
+            },
+        ),
+        ("controller_worker", "client_ca", AMPHORA_CA_CERT),
+        ("haproxy_amphora", "client_cert", AMPHORA_CA_COMBINED),
+        ("haproxy_amphora", "server_ca", AMPHORA_CA_CERT),
     )
     core_utils.sudo("octavia-db-manage", ["upgrade", "head"], user=SERVICE)
     core_utils.restart_service(
