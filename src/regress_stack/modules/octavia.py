@@ -83,7 +83,11 @@ def setup():
         ("DEFAULT", "transport_url", rabbitmq.transport_url(rabbit_user, rabbit_pass)),
         ("oslo_messaging", "topic", "octavia_prov"),
         ("api_settings", "bind_host", "0.0.0.0"),
-        ("api_settings", "enabled_provider_drivers", "ovn:Octavia OVN driver"),
+        (
+            "api_settings",
+            "enabled_provider_drivers",
+            "ovn:Octavia OVN driver, amphora:Octavia Amphora driver",
+        ),
         ("api_settings", "default_provider_driver", "ovn"),
         ("driver_agent", "enabled_provider_agents", "ovn"),
         *module_utils.dict_to_cfg_set_args(
