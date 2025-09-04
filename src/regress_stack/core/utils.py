@@ -172,6 +172,14 @@ def my_network() -> str:
         return "127.0.0.1/8"
 
 
+def iface_exists(dev: str) -> bool:
+    try:
+        run("ip", ["link", "show", dev])
+    except Exception:
+        return False
+    return True
+
+
 def exists_cache(path: pathlib.Path):
     """Wrapped function is not executed if resulting file exists."""
 
