@@ -46,6 +46,18 @@ AMPHORA_CA_COMBINED = str(pathlib.Path(CERT_DIR, "amphora_ca.cert-and-key.pem"))
 AMPHORA_CA_KEY_PASSPHRASE = "changeme"
 SOCKET_DIR = "/var/run/octavia"
 
+MGMT_SEC_GRP = "lb-mgmt"
+HM_SEC_GRP = "lb-health-mgr"
+
+MGMT_NET = "lb-mgmt"
+MGMT_SUBNET = MGMT_NET
+MGMT_SUBNET_SIZE = "24"
+MGMT_SUBNET_CIDR = f"172.16.0.0/{MGMT_SUBNET_SIZE}"
+MGMT_PORT = "lb-hm-listen"
+MGMT_PORT_IP = "172.16.0.2"
+MGMT_VETH = "hm0"
+MGMT_VETH_BR = f"{MGMT_VETH}-br"
+MGMT_BR = "o-mgmt-br"
 
 TEST_INCLUDE_REGEXES = [
     r"octavia_tempest_plugin.tests.scenario.*SIP.*",
@@ -141,6 +153,132 @@ def create_ca():
         combined.write(cert.public_bytes(serialization.Encoding.PEM))
 
 
+def ensure_mgmt_net():
+    conn = keystone.o7k()
+
+    mgmt_sec_grp = conn.network.find_security_group(MGMT_SEC_GRP)
+    if not mgmt_sec_grp:
+        mgmt_sec_grp = conn.network.create_security_group(
+            name=MGMT_SEC_GRP,
+            description="regress-stack Octavia Amphora",
+        )
+
+    if len(mgmt_sec_grp.security_group_rules) != 3:
+        for rule in mgmt_sec_grp.security_group_rules:
+            conn.network.delete_security_group_rule(rule)
+
+        conn.network.create_security_group_rule(
+            security_group_id=mgmt_sec_grp.id,
+            protocol="icmp",
+            direction="ingress",
+        )
+
+        conn.network.create_security_group_rule(
+            security_group_id=mgmt_sec_grp.id,
+            protocol="tcp",
+            direction="ingress",
+            port_range_min=22,
+            port_range_max=22,
+        )
+
+        conn.network.create_security_group_rule(
+            security_group_id=mgmt_sec_grp.id,
+            protocol="tcp",
+            direction="ingress",
+            port_range_min=9443,
+            port_range_max=9443,
+        )
+
+    hm_sec_grp = conn.network.find_security_group(HM_SEC_GRP)
+    if not hm_sec_grp:
+        hm_sec_grp = conn.network.create_security_group(
+            name=HM_SEC_GRP,
+            description="regress-stack Octavia Health Monitor",
+        )
+
+    if len(hm_sec_grp.security_group_rules) != 1:
+        for rule in hm_sec_grp.security_group_rules:
+            conn.network.delete_security_group_rule(rule)
+
+        conn.network.create_security_group_rule(
+            security_group_id=hm_sec_grp.id,
+            protocol="udp",
+            direction="ingress",
+            port_range_min=5555,
+            port_range_max=5555,
+        )
+
+    mgmt_net = conn.network.find_network(MGMT_NET)
+    if not mgmt_net:
+        mgmt_net = conn.network.create_network(
+            name=MGMT_NET,
+        )
+
+    mgmt_subnet = conn.network.find_subnet(MGMT_SUBNET)
+    if not mgmt_subnet:
+        mgmt_subnet = conn.network.create_subnet(
+            name=MGMT_SUBNET,
+            network_id=mgmt_net.id,
+            ip_version=4,
+            cidr=MGMT_SUBNET_CIDR,
+        )
+
+    mgmt_port = conn.network.find_port(MGMT_PORT)
+    if not mgmt_port:
+        mgmt_port = conn.network.create_port(
+            name=MGMT_PORT,
+            network_id=mgmt_net.id,
+            security_group_ids=[hm_sec_grp.id],
+            device_owner="Octavia:health-mgr",
+            binding_host_id=core_utils.fqdn(),
+            fixed_ips=[
+                {
+                    "ip_address": MGMT_PORT_IP,
+                    "subnet_id": mgmt_subnet.id,
+                }
+            ],
+        )
+
+    if not core_utils.iface_exists(MGMT_VETH):
+        core_utils.sudo(
+            "ip",
+            ["link", "add", MGMT_VETH, "type", "veth", "peer", "name", MGMT_VETH_BR],
+        )
+    if not core_utils.iface_exists(MGMT_BR):
+        core_utils.sudo("ip", ["link", "add", MGMT_BR, "type", "bridge"])
+
+    core_utils.sudo("ip", ["link", "set", MGMT_VETH_BR, "master", MGMT_BR])
+
+    core_utils.sudo(
+        "ip", ["link", "set", "dev", MGMT_VETH, "address", mgmt_port.mac_address]
+    )
+    core_utils.sudo(
+        "ip", ["addr", "add", f"{MGMT_PORT_IP}/{MGMT_SUBNET_SIZE}", "dev", MGMT_VETH]
+    )
+
+    core_utils.sudo("ip", ["link", "set", MGMT_BR, "up"])
+    core_utils.sudo("ip", ["link", "set", MGMT_VETH_BR, "up"])
+
+    # TODO: Don't create the rule if it already exists
+    core_utils.sudo(
+        "iptables",
+        [
+            "-I",
+            "INPUT",
+            "-i",
+            MGMT_VETH,
+            "-p",
+            "udp",
+            "--dport",
+            "5555",
+            "-j",
+            "ACCEPT",
+        ],
+    )
+
+    return (mgmt_net.id, mgmt_sec_grp.id)
+
+
 def setup():
     db_user, db_pass = mysql.ensure_service(SERVICE)
     rabbit_user, rabbit_pass = rabbitmq.ensure_service(SERVICE)
@@ -153,6 +291,7 @@ def setup():
     ca_dir = pathlib.Path(CERT_DIR)
     ca_dir.mkdir(parents=True, exist_ok=True)
     create_ca()
+    mgmt_net_id, mgmt_secgroup_id = ensure_mgmt_net()
     module_utils.cfg_set(
         CONF,
         (
@@ -193,7 +332,23 @@ def setup():
                 "ca_private_key_passphrase": AMPHORA_CA_KEY_PASSPHRASE,
             },
         ),
-        ("controller_worker", "client_ca", AMPHORA_CA_CERT),
+        *module_utils.dict_to_cfg_set_args(
+            "health_manager",
+            {
+                "bind_port": "5555",
+                "bind_ip": MGMT_PORT_IP,
+                "controller_ip_port_list": f"{MGMT_PORT_IP}:5555",
+            },
+        ),
+        *module_utils.dict_to_cfg_set_args(
+            "controller_worker",
+            {
+                "client_ca": AMPHORA_CA_CERT,
+                "amp_image_tag": "amphora",
+                "amp_secgroup_list": mgmt_secgroup_id,
+                "amp_boot_network_list": mgmt_net_id,
+            },
+        ),
         ("haproxy_amphora", "client_cert", AMPHORA_CA_COMBINED),
         ("haproxy_amphora", "server_ca", AMPHORA_CA_CERT),
     )
